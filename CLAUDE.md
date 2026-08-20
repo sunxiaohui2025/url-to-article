@@ -15,9 +15,10 @@
 ## 目录结构
 
 ```
+run_skill.py           # skill 根目录入口（导出 generate/run，供宿主 agent 脚本运行器调用）
 src/
 ├── config.py           # 配置（无任何 LLM 硬编码凭据）
-├── main.py             # 主入口：抓取 + 提取 + 保存原始素材
+├── main.py             # 抓取 + 提取 + 保存原始素材
 ├── fetchers/
 │   ├── x_fetcher.py          # X 平台（Playwright）
 │   ├── x_fetcher_backup.py   # X 备用方案（fxtwitter JSON API）
@@ -32,8 +33,11 @@ output/                 # 输出目录（被 .gitignore 排除）
 ## 常用命令
 
 ```bash
+# 宿主 agent 经脚本运行器调用（推荐）：
+#   result = run_skill.generate(url="<URL>")
+
 # 抓取并提取（保存原始素材到 output/）
-python -m src.main "<URL>"
+python run_skill.py "<URL>"        # 等价 python -m src.main "<URL>"
 
 # 运行环境
 python3 -m venv .venv && source .venv/bin/activate

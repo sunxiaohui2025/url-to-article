@@ -21,23 +21,30 @@
 
 ## 使用方法
 
-### 基本用法
+### 宿主 agent 环境（推荐，脚本运行器）
+
+宿主 agent 通过 `run_skill.py`（skill 根目录入口，导出 `generate`/`run`）调用：
+
+```python
+# run_skill.generate / run 接收 url 参数，返回提取结果与素材路径
+result = run_skill.generate(url="https://x.com/hwchase17/status/2085780032031760694")
+```
+
+```bash
+# 等价命令行
+python run_skill.py "<URL>"
+```
+
+> `run_skill.py` 会把 skill 根目录加入 sys.path，从而解决
+> `src/main.py` 无法作为入口导入的问题（`No module named 'src'`）。
+
+### 终端直接运行（本地调试）
 
 ```bash
 python -m src.main "<URL>"
 ```
 
-### 示例
-
-```bash
-# 处理 X 平台推文
-python -m src.main "https://x.com/hwchase17/status/2085780032031760694"
-
-# 处理技术博客
-python -m src.main "https://example.com/article"
-```
-
-运行后得到原始素材（`output/extract_*.json` 与 `output/extract_*.md`），
+两种方式运行后都会得到原始素材（`output/extract_*.json` 与 `output/extract_*.md`），
 宿主 agent 读取素材并按 `prompts/` 模板生成最终成品。
 
 ## 输出说明
@@ -105,9 +112,10 @@ playwright install chromium
 ## 技术架构
 
 ```
+run_skill.py           # skill 根目录入口（导出 generate/run，供宿主 agent 脚本运行器调用）
 src/
 ├── config.py          # 配置管理（无任何 LLM 硬编码凭据）
-├── main.py            # 主入口：抓取 + 提取 + 保存素材
+├── main.py            # 抓取 + 提取 + 保存素材
 ├── fetchers/          # 内容抓取器
 │   ├── x_fetcher.py          # X 平台（Playwright）
 │   ├── x_fetcher_backup.py   # X 备用方案（fxtwitter）

@@ -47,9 +47,22 @@ playwright install chromium
 
 ## 使用方法
 
+### 宿主 agent 环境（推荐）
+
+宿主 agent 用 `run_skill.py` 的 `generate` / `run` 入口调用（该文件位于 skill 根目录，
+已解决 `src/main.py` 无法作为脚本入口导入的问题）：
+
+```python
+import run_skill
+result = run_skill.generate(url="https://x.com/username/status/123456789")
+```
+
 ### 命令行使用
 
 ```bash
+# 经 run_skill.py 入口
+python run_skill.py "https://x.com/username/status/123456789"
+# 或直接运行模块
 python -m src.main "https://x.com/username/status/123456789"
 ```
 
@@ -119,9 +132,10 @@ output/
 
 ```
 url-to-article/
+├── run_skill.py               # skill 根目录入口（导出 generate/run，供宿主 agent 脚本运行器调用）
 ├── src/
 │   ├── config.py              # 配置管理（无 LLM 硬编码凭据）
-│   ├── main.py                # 主入口：抓取 + 提取 + 保存素材
+│   ├── main.py                # 抓取 + 提取 + 保存素材
 │   ├── fetchers/
 │   │   ├── x_fetcher.py       # X 平台（Playwright）
 │   │   ├── x_fetcher_backup.py# X 备用方案（fxtwitter）
