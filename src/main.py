@@ -11,12 +11,22 @@ from src.fetchers.generic_fetcher import GenericFetcher
 from src.extractors.x_extractor import XExtractor
 from src.extractors.generic_extractor import GenericExtractor
 from src.config import Config
+from src.utils.image_utils import get_first_large_image
+from src.utils.language_utils import detect_language
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import re
 from datetime import datetime
 import json
 import hashlib
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 class ArticleExtractor:
@@ -28,6 +38,10 @@ class ArticleExtractor:
         self.x_extractor = XExtractor()
         self.generic_fetcher = GenericFetcher()
         self.generic_extractor = GenericExtractor()
+
+        # 创建banners目录
+        self.banner_dir = Config.OUTPUT_DIR / "banners"
+        self.banner_dir.mkdir(exist_ok=True)
 
     def process_url(self, url: str, save_to_file: bool = True) -> dict:
         """
@@ -87,7 +101,19 @@ class ArticleExtractor:
         # 备用方案
         if use_backup:
             print("\n[使用备用抓取方案]")
-            backup_result = self.x_fetcher_backup.fetch(url)
+            try:
+                backup_result = self.x_fetcher_backup.fetch(url)
+            except Exception as e:
+                # 直接抓取 + 所有备用通道都失败 → 返回清晰错误，而不是让进程崩溃
+                print(f"✗ {e}")
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "hint": (
+                        "无法连接 x.com 及其镜像服务（可能是网络/代理受限或服务临时不可用），"
+                        "请检查网络后重试。"
+                    ),
+                }
 
             extracted = {
                 'tweets': [{
@@ -120,11 +146,7 @@ class ArticleExtractor:
             if backup_result.get('lang'):
                 extracted['language'] = backup_result['lang']
             else:
-                try:
-                    import langdetect
-                    extracted['language'] = langdetect.detect(extracted['full_text'])
-                except Exception:
-                    extracted['language'] = 'en'  # 默认英文
+                extracted['language'] = detect_language(extracted['full_text'], default='en')
 
             print(f"  正文长度: {len(extracted['full_text'])} 字符")
 
@@ -135,11 +157,29 @@ class ArticleExtractor:
         print(f"  - 图片数量: {len(extracted['media']['images'])}")
         print(f"  - 视频数量: {len(extracted['media']['videos'])}")
 
+        # 提取第一张大于640的图片（用于banner）
+        large_image = None
+        if extracted['media']['images']:
+            print("\n[提取大尺寸图片用于banner...]")
+            large_image = get_first_large_image(extracted['media']['images'], min_width=640, min_height=640)
+            if large_image:
+                print(f"✓ 找到大尺寸图片: {large_image['width']}x{large_image['height']}")
+            else:
+                print("⚠ 未找到大于640的图片")
+
         # 3. 保存原始素材
         saved_files = {}
         if save_to_file:
             print("\n[步骤 3/3] 保存提取结果...")
-            saved_files = self._save_x_extraction(url, extracted)
+            saved_files = self._save_x_extraction(url, extracted, large_image)
+
+            # 保存Banner 1 (图片信息) 如果有
+            if large_image:
+                file_id = re.search(r'/status/(\d+)', url).group(1) if re.search(r'/status/(\d+)', url) else datetime.now().strftime("%Y%m%d%H%M%S")
+                banner_path = self._save_image_banner(f"extract_{file_id}", large_image)
+                if banner_path:
+                    saved_files['banner_image'] = banner_path
+
             print(f"✓ 素材已保存到: {Config.OUTPUT_DIR}")
 
         return {
@@ -152,6 +192,7 @@ class ArticleExtractor:
             "tweets": extracted['tweets'],
             "full_text": extracted['full_text'],
             "media": extracted['media'],
+            "large_image": large_image,  # 添加大尺寸图片信息
             "saved_files": saved_files,
             "hint": "LLM 任务（推文串整合/翻译/HTML/Banner）请由宿主 agent 参照 prompts/ 模板完成"
         }
@@ -181,13 +222,8 @@ class ArticleExtractor:
             return {"success": False, "error": str(e)}
 
         # 3. 检测语言（解析逻辑，非 LLM）
-        try:
-            import langdetect
-            language = langdetect.detect(extracted['text'])
-            print(f"  检测语言: {language}")
-        except Exception as e:
-            print(f"⚠ 语言检测失败: {e}，默认为英文")
-            language = 'en'
+        language = detect_language(extracted['text'], default='en')
+        print(f"  - 检测语言: {language}")
 
         # 构造素材结构
         metadata = {
@@ -201,13 +237,31 @@ class ArticleExtractor:
             'videos': []
         }
 
+        # 提取第一张大于640的图片（用于banner）
+        large_image = None
+        if media['images']:
+            print("\n[提取大尺寸图片用于banner...]")
+            large_image = get_first_large_image(media['images'], min_width=640, min_height=640)
+            if large_image:
+                print(f"✓ 找到大尺寸图片: {large_image['width']}x{large_image['height']}")
+            else:
+                print("⚠ 未找到大于640的图片")
+
         # 保存原始素材
         saved_files = {}
         if save_to_file:
             print("\n[步骤 3/3] 保存提取结果...")
             saved_files = self._save_generic_extraction(
-                url, extracted, metadata, media, language
+                url, extracted, metadata, media, language, large_image
             )
+
+            # 保存Banner 1 (图片信息) 如果有
+            if large_image:
+                url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+                banner_path = self._save_image_banner(f"extract_{url_hash}", large_image)
+                if banner_path:
+                    saved_files['banner_image'] = banner_path
+
             print(f"✓ 素材已保存到: {Config.OUTPUT_DIR}")
 
         return {
@@ -217,6 +271,7 @@ class ArticleExtractor:
             "language": language,
             "full_text": extracted['text'],
             "media": media,
+            "large_image": large_image,  # 添加大尺寸图片信息
             "saved_files": saved_files,
             "hint": "LLM 任务（翻译/HTML/Banner）请由宿主 agent 参照 prompts/ 模板完成"
         }
@@ -224,53 +279,69 @@ class ArticleExtractor:
     # ------------------------------------------------------------------
     # 保存原始素材
     # ------------------------------------------------------------------
-    def _save_x_extraction(self, url: str, extracted: dict) -> dict:
+    def _save_x_extraction(self, url: str, extracted: dict, large_image: Optional[dict] = None) -> dict:
         """保存 X 提取结果（JSON + 易读的 Markdown 素材）"""
         match = re.search(r'/status/(\d+)', url)
         file_id = match.group(1) if match else datetime.now().strftime("%Y%m%d%H%M%S")
+
+        data = {
+            "url": url,
+            "platform": "x.com",
+            "metadata": extracted['metadata'],
+            "language": extracted['language'],
+            "is_thread": extracted['is_thread'],
+            "tweet_count": len(extracted['tweets']),
+            "tweets": extracted['tweets'],
+            "full_text": extracted['full_text'],
+            "media": extracted['media'],
+        }
+
+        # 添加大尺寸图片信息
+        if large_image:
+            data['large_image'] = large_image
+
         return self._write_extraction(
             f"extract_{file_id}",
-            {
-                "url": url,
-                "platform": "x.com",
-                "metadata": extracted['metadata'],
-                "language": extracted['language'],
-                "is_thread": extracted['is_thread'],
-                "tweet_count": len(extracted['tweets']),
-                "tweets": extracted['tweets'],
-                "full_text": extracted['full_text'],
-                "media": extracted['media'],
-            },
+            data,
             title=extracted['metadata'].get('title'),
             full_text=extracted['full_text'],
             media=extracted['media'],
+            large_image=large_image,
             extra={
                 "tweets": extracted['tweets'],
                 "is_thread": extracted['is_thread'],
             },
         )
 
-    def _save_generic_extraction(self, url: str, extracted: dict, metadata: dict, media: dict, language: str) -> dict:
+    def _save_generic_extraction(self, url: str, extracted: dict, metadata: dict, media: dict, language: str, large_image: Optional[dict] = None) -> dict:
         """保存通用网页提取结果（JSON + 易读的 Markdown 素材）"""
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+
+        data = {
+            "url": url,
+            "platform": "generic",
+            "metadata": metadata,
+            "language": language,
+            "title": extracted['title'],
+            "full_text": extracted['text'],
+            "media": media,
+        }
+
+        # 添加大尺寸图片信息
+        if large_image:
+            data['large_image'] = large_image
+
         return self._write_extraction(
             f"extract_{url_hash}",
-            {
-                "url": url,
-                "platform": "generic",
-                "metadata": metadata,
-                "language": language,
-                "title": extracted['title'],
-                "full_text": extracted['text'],
-                "media": media,
-            },
+            data,
             title=metadata.get('title'),
             full_text=extracted['text'],
             media=media,
+            large_image=large_image,
             extra={},
         )
 
-    def _write_extraction(self, name: str, data: dict, title: str, full_text: str, media: dict, extra: dict) -> dict:
+    def _write_extraction(self, name: str, data: dict, title: str, full_text: str, media: dict, large_image: Optional[dict], extra: dict) -> dict:
         """写入 JSON 与 Markdown 两份原始素材，返回路径"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"{name}_{timestamp}"
@@ -281,14 +352,14 @@ class ArticleExtractor:
 
         md_path = Config.OUTPUT_DIR / f"{base}.md"
         md = self._build_markdown(title, data.get('metadata', {}), data.get('language', ''),
-                                  media, full_text, extra)
+                                  media, full_text, large_image, extra)
         with open(md_path, 'w', encoding='utf-8') as f:
             f.write(md)
 
         return {"json": str(json_path), "markdown": str(md_path)}
 
     def _build_markdown(self, title: str, metadata: dict, language: str,
-                        media: dict, full_text: str, extra: dict) -> str:
+                        media: dict, full_text: str, large_image: Optional[dict], extra: dict) -> str:
         """把提取结果整理成宿主 agent 易读的 Markdown 素材源"""
         lines = []
 
@@ -334,6 +405,15 @@ class ArticleExtractor:
             for v in videos:
                 lines.append(f"- 视频: {v}")
 
+        # 大尺寸图片（用于Banner）
+        if large_image:
+            lines.append("")
+            lines.append("## Banner 图片")
+            lines.append(f"- **URL**: {large_image['url']}")
+            lines.append(f"- **尺寸**: {large_image['width']}x{large_image['height']}")
+            lines.append("")
+            lines.append("> 此图片尺寸大于640，可直接用作文章Banner（第一个Banner选项）")
+
         lines.append("")
         lines.append("---")
         lines.append("_生成说明：以上素材由 url-to-article skill 提取。请宿主 agent 参照")
@@ -343,6 +423,23 @@ class ArticleExtractor:
         lines.append("")
 
         return "\n".join(lines)
+
+    def _save_image_banner(self, file_id: str, large_image: dict) -> Optional[str]:
+        """保存图片Banner信息到JSON文件"""
+        try:
+            banner_path = self.banner_dir / f"{file_id}_banner_image.json"
+            with open(banner_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    "type": "image",
+                    "url": large_image['url'],
+                    "width": large_image['width'],
+                    "height": large_image['height']
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"✓ Banner 1 (图片) 已保存: {banner_path}")
+            return str(banner_path)
+        except Exception as e:
+            logger.error(f"保存图片Banner失败: {e}")
+            return None
 
 
 def main():

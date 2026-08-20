@@ -18,25 +18,33 @@ class XFetcherBackup:
             dict: 包含推文信息
         """
         print(f"使用备用方案抓取: {url}")
-        
+
         # 尝试多个备用服务：优先 JSON API（可拿到长文全文），
-        # og:description 会被 X 截断，只作为最后兜底
+        # og:description 会被 X 截断，只作为最后兜底。
+        # 第三方镜像站偶发不稳定，多留几个通道 + 单个服务内部重试。
         services = [
             self._fetch_fxtwitter_api,
+            self._fetch_vxtwitter_api,
             self._fetch_vxtwitter,
             self._fetch_fxtwitter,
+            self._fetch_oembed,
         ]
 
+        errors = []
         for service in services:
             try:
                 result = service(url)
                 if result and result.get('text'):
+                    print(f"  ✓ 备用方案成功（{result.get('source')}）")
                     return result
             except Exception as e:
+                errors.append(f"{getattr(service, '__name__', 'service')}: {e}")
                 print(f"  ✗ 服务失败: {e}")
                 continue
-        
-        raise Exception("所有备用服务均失败")
+
+        # 所有备用通道都失败：给出汇总信息，便于区分「网络不通」与「代码问题」
+        summary = "；".join(errors[:6]) if errors else "无可用通道"
+        raise Exception(f"所有备用服务均失败（可能是网络受限，无法访问 x.com 及其镜像服务）: {summary}")
     
     def _fetch_fxtwitter_api(self, url: str) -> dict:
         """
@@ -47,45 +55,39 @@ class XFetcherBackup:
         - X Article 长文的全部段落（article.content.blocks）
         - 全部媒体资源
         """
-        match = re.search(
-            r'(?:x\.com|twitter\.com)/([^/]+)/status/(\d+)', url
-        )
-        if not match:
+        handle, status_id = self._get_url_parts(url)
+        if not handle:
             return None
-
-        handle, status_id = match.group(1), match.group(2)
         api_url = f"https://api.fxtwitter.com/{handle}/status/{status_id}"
-
         print(f"  尝试 fxtwitter API: {api_url}")
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+        response = self._get_with_retry(api_url, headers=headers)
+        result = self._parse_meta_json(response.json())
+        if result:
+            result['source'] = 'fxtwitter-api'
+            print(f"  ✓ fxtwitter API 成功，正文 {len(result['text'])} 字符")
+            return result
+        return None
 
-        response = requests.get(api_url, headers=headers, timeout=30)
-        response.raise_for_status()
-
-        data = response.json()
+    def _parse_meta_json(self, data: dict) -> dict:
+        """通用解析 fxtwitter / vxtwitter 风格的 JSON 推文结构"""
         tweet = data.get('tweet') or {}
         if not tweet:
             return None
 
         parts = []
         title = ''
-
-        # 1. 推文正文（去掉尾部的 t.co 短链）
         tweet_text = (tweet.get('text') or '').strip()
         tweet_text = re.sub(r'\s*https://t\.co/\w+\s*$', '', tweet_text).strip()
         if tweet_text:
             parts.append(tweet_text)
 
-        # 2. X Article 长文全文
         article = tweet.get('article') or {}
         if article:
             title = (article.get('title') or '').strip()
             if title:
                 parts.append(title)
-
             blocks = ((article.get('content') or {}).get('blocks')) or []
             block_texts = [
                 (b.get('text') or '').strip()
@@ -99,47 +101,109 @@ class XFetcherBackup:
                 parts.append(article['preview_text'].strip())
 
         text = "\n\n".join(parts).strip()
+        if not text:
+            return None
 
-        # 3. 媒体资源
-        images = []
-        videos = []
-
-        cover = (article.get('cover_media') or {}) if article else {}
-        cover_url = ((cover.get('media_info') or {}).get('original_img_url'))
-        if cover_url:
-            images.append(cover_url)
-
-        for entity in (article.get('media_entities') or []) if article else []:
-            media_info = entity.get('media_info') or {}
-            img = media_info.get('original_img_url')
+        images, videos = [], []
+        cover = ((article.get('cover_media') or {}).get('media_info') or {}).get('original_img_url')
+        if cover and cover not in images:
+            images.append(cover)
+        for entity in (article.get('media_entities') or []):
+            img = (entity.get('media_info') or {}).get('original_img_url')
             if img and img not in images:
                 images.append(img)
-
-        media = tweet.get('media') or {}
-        for item in (media.get('all') or []):
-            item_type = item.get('type')
+        for item in (tweet.get('media') or {}).get('all') or []:
             item_url = item.get('url')
             if not item_url:
                 continue
-            if item_type == 'photo' and item_url not in images:
+            if item.get('type') == 'photo' and item_url not in images:
                 images.append(item_url)
-            elif item_type in ('video', 'gif') and item_url not in videos:
+            elif item.get('type') in ('video', 'gif') and item_url not in videos:
                 videos.append(item_url)
 
-        if text:
-            print(f"  ✓ fxtwitter API 成功，正文 {len(text)} 字符")
-            return {
-                'text': text,
-                'title': title,
-                'author': (tweet.get('author') or {}).get('name', ''),
-                'created_at': tweet.get('created_at', ''),
-                'lang': tweet.get('lang', ''),
-                'images': images,
-                'videos': videos,
-                'source': 'fxtwitter-api'
-            }
+        return {
+            'text': text,
+            'title': title,
+            'author': (tweet.get('author') or {}).get('name', ''),
+            'created_at': tweet.get('created_at', ''),
+            'lang': tweet.get('lang', ''),
+            'images': images,
+            'videos': videos,
+        }
 
+    def _get_url_parts(self, url: str):
+        """从 x/twitter 链接解析出 handle 与 status_id"""
+        m = re.search(r'(?:x\.com|twitter\.com)/([^/]+)/status/(\d+)', url)
+        return (m.group(1), m.group(2)) if m else (None, None)
+
+    def _fetch_vxtwitter_api(self, url: str) -> dict:
+        """使用 api.vxtwitter.com JSON 接口（结构同 fxtwitter）"""
+        handle, status_id = self._get_url_parts(url)
+        if not handle:
+            return None
+        api_url = f"https://api.vxtwitter.com/{handle}/status/{status_id}"
+        print(f"  尝试 vxtwitter API: {api_url}")
+
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+        response = self._get_with_retry(api_url, headers=headers)
+        result = self._parse_meta_json(response.json())
+        if result:
+            result['source'] = 'vxtwitter-api'
+            print(f"  ✓ vxtwitter API 成功，正文 {len(result['text'])} 字符")
+            return result
         return None
+
+    def _fetch_oembed(self, url: str) -> dict:
+        """使用 Twitter 官方 oEmbed 接口兜底（能拿到推文简介与作者）"""
+        oembed_url = f"https://publish.twitter.com/oembed?url={url}"
+        print(f"  尝试官方 oEmbed: publish.twitter.com/oembed")
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+        try:
+            response = requests.get(oembed_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+        except Exception:
+            return None
+
+        # oEmbed 返回 html / title / author_name，抽出纯文本作为最后兜底
+        html = data.get('html') or ''
+        author = data.get('author_name') or ''
+        soup = BeautifulSoup(html, 'lxml')
+        text = soup.get_text('\n', strip=True)
+        # oEmbed 会带「在 X 上查看/查看动态」等尾注，尽量只保留推文正文
+        for marker in ('在 X 上查看', 'View on X', '查看动态', '分享', 'Follow'):
+            if marker in text:
+                text = text.split(marker)[0].strip()
+        if not text:
+            return None
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        if len(text) < 20:  # 太短说明只有按钮文字，不可用
+            return None
+        print(f"  ✓ 官方 oEmbed 兜底成功，正文 {len(text)} 字符")
+        return {
+            'text': text,
+            'title': data.get('title') or '',
+            'author': author,
+            'created_at': '',
+            'lang': '',
+            'images': [],
+            'videos': [],
+            'source': 'oembed',
+        }
+
+    def _get_with_retry(self, url: str, headers: dict, tries: int = 3, timeout: int = 30):
+        """带重试的 GET：镜像站偶发 SSL/连接被断，多试几次更稳"""
+        import time as _time
+        last_exc = None
+        for i in range(tries):
+            try:
+                return requests.get(url, headers=headers, timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if i < tries - 1:
+                    print(f"  （第 {i + 1} 次失败: {e}，重试…）")
+                    _time.sleep(1.5)
+        raise last_exc
 
     def _fetch_vxtwitter(self, url: str) -> dict:
         """使用 vxtwitter.com"""
